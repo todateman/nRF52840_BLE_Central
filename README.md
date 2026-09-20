@@ -1,10 +1,11 @@
-﻿# M5NanoC6 BLE Central → Seeed Xiao nRF52840 移植版
+﻿# nRF52840 BLE Central
 
 [Seeed Xiao nRF52840](https://wiki.seeedstudio.com/XIAO_BLE/) を使用した BLE Central (クライアント) 実装サンプルです。  
 M5Stack シリーズ（ESP32）では Wi-Fi と BLE を同時利用できないという制約があるため、これを回避するために本ボードを外付け BLE 受信機 (ブリッジ) として用い、取得した BLE Notify データを I2C スレーブとして保持し、[Chibi-T_Furoshiki_Logger](https://github.com/todateman/Chibi-T_Furoshiki_Logger)の M5Stack Basic（I2C マスター）からの読み出し要求に応じて返します。  
 （I2Cスレーブアドレス: 0x08, SDA=D4, SCL=D5）
 
-> 本プロジェクトはもともと [M5NanoC6](https://docs.m5stack.com/ja/core/M5NanoC6)（ESP32-C6）向けに実装されていましたが、arduino-esp32 の `Wire` ライブラリが ESP32-C6 では I2C スレーブの読み取り要求 (`onRequest`) を構造的に発火できないという既知の制限があり、ESP-IDF ネイティブ API への切り替え・クロックストレッチ調整・自己修復ロジックなど対症療法的な対応を重ねても安定しなかったため、I2C マスター(TWIM)とスレーブ(TWIS)が別ハードウェアペリフェラルである **Seeed Xiao nRF52840** に切り替えました。詳細は後述の「スレーブ側の実装メモ」を参照してください。
+> 本プロジェクトはもともと [M5NanoC6](https://docs.m5stack.com/ja/core/M5NanoC6)（ESP32-C6）向けに実装されていましたが、arduino-esp32 の `Wire` ライブラリが ESP32-C6 では I2C スレーブの読み取り要求 (`onRequest`) を構造的に発火できないという既知の制限があり、ESP-IDF ネイティブ API への切り替え・クロックストレッチ調整・自己修復ロジックなど対症療法的な対応を重ねても安定しなかったため、I2C マスター(TWIM)とスレーブ(TWIS)が別ハードウェアペリフェラルである **Seeed Xiao nRF52840** に切り替えました。　　
+> 詳細は後述の「スレーブ側の実装メモ」を参照してください。
 
 ## 特徴
 
@@ -54,13 +55,16 @@ Service UUID は両ペリフェラルで共通のため、接続先の判別は 
 | Write Characteristic（存在確認用、実データなし） | `c9f878f1-c311-4452-ae5e-e813b4fe057d` |
 | Notify Characteristic | `1d25ec49-e19c-4bb6-8c36-5dc8d8aaaebe` |
 
-※ UUID は Version4 で生成。ペリフェラル側が同一 UUID を持つ必要があります（Service UUID のみ共通、Characteristic UUID はペリフェラルごとに異なります）。
+> ※ UUID は Version4 で生成。  
+> ペリフェラル側が同一 UUID を持つ必要がある
+> （Service UUID のみ共通、Characteristic UUID はペリフェラルごとに異なる
 
 ## 動作概要
 
 1. 起動時に I2C スレーブと BLE Central を初期化し、アクティブスキャンを開始  
    （Service UUID は共通のため、アドバタイズ名で Heater / AutoAirAdjust を判別する。両者ともデバイス名が Scan Response 側に含まれるため、名前判別にはアクティブスキャンが必須。**Scanner の `filterUuid()` は使用しない**——Service UUID は ADV_IND 側、名前は Scan Response 側という別々のパケットに分かれて送られてくるため、UUIDフィルタを設定すると名前が載っている側のパケットが「UUIDを含まない」という理由で `scanCallback()` に渡る前に捨てられてしまい、永久に接続できなくなる不具合があった）
-2. 対象デバイスを検出すると接続要求（見つかった方から順に、部分的な接続を許容。片方だけでも正常に動作する）。この時点で該当ペリフェラルを `STATE_DO_CONNECT` としてマークしておく
+2. 対象デバイスを検出すると接続要求（見つかった方から順に、部分的な接続を許容。片方だけでも正常に動作する）  
+   この時点で該当ペリフェラルを `STATE_DO_CONNECT` としてマークしておく
 3. 接続後（`connectCallback`）:
    - 接続先の判別は、スキャン時点で `STATE_DO_CONNECT` にマークしておいたペリフェラルをそのまま使う（以前は接続後に `BLEConnection::getPeerName()` でGATT経由のGAP Device Nameキャラクタリスティックを読み直して判別していたが、本プロジェクトが使う既定ATT MTU(23byte)ではRead By Type応答が最大19byteしか運べず、`"ChibiT-AutoAirAdjust"`(20byte)や`"M5Din Furoshiki Heater"`(22byte)のような名前が末尾で切り詰められて必ず不一致になり、「Unexpected device connected」として即切断される不具合があったため撤廃した）
    - Service / Write キャラクタリスティックの探索（Write キャラクタリスティックは現状未使用／将来拡張枠）
@@ -81,7 +85,8 @@ Service UUID は両ペリフェラルで共通のため、接続先の判別は 
 - Heater・AutoAirAdjustのいずれか未接続: **赤色LEDのみ**点灯
 - Heater・AutoAirAdjust両方接続完了: **青色LEDのみ**点灯
 
-実機検証の結果、Xiao nRF52840のオンボードLED(赤・青)は `variant.h` の定義（`LED_STATE_ON=1`、active-high）とは逆に、実際には **active-low**（LOWを出力すると点灯）であることが判明した。`variant.h` 自体は他ライブラリへの影響を避けるため変更せず、`src/main.cpp` 内でのみ実機の実際の極性に合わせた `LED_ON` / `LED_OFF` マクロを定義し、以降はこちらを使用する。
+実機検証の結果、Xiao nRF52840のオンボードLED(赤・青)は `variant.h` の定義（`LED_STATE_ON=1`、active-high）とは逆に、実際には **active-low**（LOWを出力すると点灯）であることが判明した。  
+`variant.h` 自体は他ライブラリへの影響を避けるため変更せず、`src/main.cpp` 内でのみ実機の実際の極性に合わせた `LED_ON` / `LED_OFF` マクロを定義し、以降はこちらを使用する。
 
 ### シンプルなデータフロー（論理）
 
@@ -99,21 +104,21 @@ include/, lib/, test/ README のみ (拡張用)
 
 ## I2C通信仕様
 
-AutoAirAdjust 側の BLE 送信機能は [feature/BLE ブランチ, commit 5b8b8aa](https://github.com/todateman/Chibi-T_Furoshiki_AutoAirAdjust) で実装済みで、本 Central 側も対応済みです。プロトコル自体は M5NanoC6 版から変更していないため、**M5Stack Basic（マスター）側の実装は無変更**で利用できます。
+AutoAirAdjust 側の BLE 送信機能は [feature/BLE ブランチ, commit 5b8b8aa](https://github.com/todateman/Chibi-T_Furoshiki_AutoAirAdjust) で実装済みで、本 Central 側も対応済みです。  
 
 - スレーブアドレス: `0x08`
 - ピン: SDA=D4, SCL=D5（Xiao nRF52840の既定Wireピン）
 - コマンド方式: マスターは読み出し前に1バイトのコマンドコードを書き込み、どのデータを要求するかを明示する
   - `CMD_ENGINE_TEMP` (`0x01`): <https://github.com/todateman/Chibi-T_Furoshiki_Heater> からエンジン温度データ (*.**°Ｃ) を要求
-  - `CMD_PRI_PRE` (`0x02`): <https://github.com/todateman/Chibi-T_Furoshiki_AutoAirAdjust> から1次側空気圧センサデータ (*.**MPa) を要求
-  - `CMD_SEC_PRE` (`0x03`): <https://github.com/todateman/Chibi-T_Furoshiki_AutoAirAdjust> から2次側空気圧センサデータ (*.**MPa) を要求
-  - `CMD_FUEL_PRE` (`0x04`): <https://github.com/todateman/Chibi-T_Furoshiki_AutoAirAdjust> から燃圧センサデータ (*.**MPa) を要求
+  - `CMD_PRI_PRE` (`0x02`): <https://github.com/todateman/Chibi-T_Furoshiki_AutoAirAdjust> から1次側空気圧センサデータ (*.***MPa) を要求
+  - `CMD_SEC_PRE` (`0x03`): <https://github.com/todateman/Chibi-T_Furoshiki_AutoAirAdjust> から2次側空気圧センサデータ (*.***MPa) を要求
+  - `CMD_FUEL_PRE` (`0x04`): <https://github.com/todateman/Chibi-T_Furoshiki_AutoAirAdjust> から燃圧センサデータ (*.***MPa) を要求
   - 未定義のコマンドを書き込んだ場合は長さ0（先頭バイトが `0x00`）の空フレームを返す
   - `CMD_PRI_PRE` / `CMD_SEC_PRE` / `CMD_FUEL_PRE` の3つは同一の BLE ペリフェラル（M5Core2、Chibi-T_Furoshiki_AutoAirAdjust）から届く。  
   ペリフェラル側は1本の Notify Characteristic で3種類のデータを送るため、Xiao nRF52840 は改行区切りメッセージの先頭タグでデータ種別を判別し、それぞれ専用フレームに格納する
-    - `PRI:` → `CMD_PRI_PRE` 用フレーム（例: `PRI:0.85\n`）
-    - `SEC:` → `CMD_SEC_PRE` 用フレーム（例: `SEC:0.72\n`）
-    - `FUEL:` → `CMD_FUEL_PRE` 用フレーム（例: `FUEL:2.10\n`）
+    - `PRI:` → `CMD_PRI_PRE` 用フレーム（例: `PRI:0.853\n`）
+    - `SEC:` → `CMD_SEC_PRE` 用フレーム（例: `SEC:0.724\n`）
+    - `FUEL:` → `CMD_FUEL_PRE` 用フレーム（例: `FUEL:2.107\n`）
     - いずれのタグにも一致しないメッセージは従来どおり `CMD_ENGINE_TEMP` 用フレームに格納する（後方互換）
 - フレーム形式: 32バイト固定
   - `[0]`: データ長 (0〜30)
@@ -126,10 +131,15 @@ AutoAirAdjust 側の BLE 送信機能は [feature/BLE ブランチ, commit 5b8b8
 
 Xiao nRF52840 は Adafruit nRF52 Arduino コアの標準 `Wire` ライブラリ（`Wire.begin(address)` + `Wire.onReceive()` + `Wire.onRequest()`）でそのまま I2C スレーブとして動作します。
 
-- **なぜ M5NanoC6 (ESP32-C6) で問題になったか**: arduino-esp32 の I2C スレーブ HAL 実装は、マスターの読み取り要求を検出するために使う SCL クロックストレッチ原因の判定が ESP32-C3 / S3 専用の分岐になっており、ESP32-C6 では常に `I2C_STRETCH_CAUSE_MAX` を返す。そのため `Wire.onRequest()` が構造的に一度も発火しない（arduino-esp32 側の既知の制限）。回避のため ESP-IDF ネイティブの `driver/i2c_slave.h` を直接使用する実装に切り替えたが、その後もクロックストレッチのタイミング・割り込み優先度・TXリングバッファの詰まりなど対症療法的なチューニングが必要になった
-- **nRF52840 でなぜ標準Wireのままで良いか**: nRF52840 は I2C マスター用の `TWIM` と I2C スレーブ用の `TWIS` が別ハードウェアペリフェラルとして実装されている。`TWIS` はマスターの読み取り開始時、ソフトウェアが `onRequest` コールバック内で送信バッファ（`Wire.write()`）を準備し終えるまでハードウェアが自動的にクロックストレッチを維持する設計になっており、ESP32-C6 のように「コールバックが返った直後に強制的にストレッチが解除されて間に合わない」という問題が起きない。Adafruit nRF52 Arduino コアには I2C スレーブのサンプル（`libraries/Wire/examples/secondary_sender`, `secondary_receiver`）が公式に用意されており、標準 API がスレーブモードで動作することが確認できる
-- **注意**: `Wire.onReceive()`/`Wire.onRequest()` のコールバックは（ESP32版のタスク委譲と異なり）TWIS の割り込みハンドラから直接呼ばれる。そのため実装では、コールバック内では応答フレームの確定（`memcpy`+`Wire.write()`）のみを行い、`Serial` 出力などの重い処理は避けている（`src/main.cpp` の `receiveEvent`/`requestEvent` を参照）
-- 実機での長時間動作検証はまだ行っていないため、BLEスキャン処理とI2C応答が競合して不安定になるようであれば、`receiveEvent`/`requestEvent` 周辺に自己修復ロジックを再導入する余地を残してある
+- **なぜ M5NanoC6 (ESP32-C6) で問題になったか**: arduino-esp32 の I2C スレーブ HAL 実装は、マスターの読み取り要求を検出するために使う SCL クロックストレッチ原因の判定が ESP32-C3 / S3 専用の分岐になっており、ESP32-C6 では常に `I2C_STRETCH_CAUSE_MAX` を返す。  
+  そのため `Wire.onRequest()` が構造的に一度も発火しない（arduino-esp32 側の既知の制限）。  
+  回避のため ESP-IDF ネイティブの `driver/i2c_slave.h` を直接使用する実装に切り替えたが、その後もクロックストレッチのタイミング・割り込み優先度・TXリングバッファの詰まりなど対症療法的なチューニングが必要になった
+- **nRF52840 でなぜ標準Wireのままで良いか**: nRF52840 は I2C マスター用の `TWIM` と I2C スレーブ用の `TWIS` が別ハードウェアペリフェラルとして実装されている。  
+  `TWIS` はマスターの読み取り開始時、ソフトウェアが `onRequest` コールバック内で送信バッファ（`Wire.write()`）を準備し終えるまでハードウェアが自動的にクロックストレッチを維持する設計になっており、ESP32-C6 のように「コールバックが返った直後に強制的にストレッチが解除されて間に合わない」という問題が起きない。  
+  Adafruit nRF52 Arduino コアには I2C スレーブのサンプル（`libraries/Wire/examples/secondary_sender`, `secondary_receiver`）が公式に用意されており、標準 API がスレーブモードで動作することが確認できる
+- **注意**: `Wire.onReceive()`/`Wire.onRequest()` のコールバックは（ESP32版のタスク委譲と異なり）TWIS の割り込みハンドラから直接呼ばれる。  
+  そのため実装では、コールバック内では応答フレームの確定（`memcpy`+`Wire.write()`）のみを行い、`Serial` 出力などの重い処理は避けている（`src/main.cpp` の `receiveEvent`/`requestEvent` を参照）
+- 実機での長時間動作検証（3h 程度）では問題は発覚していないが、もしBLEスキャン処理とI2C応答が競合して不安定になるようであれば、`receiveEvent`/`requestEvent` 周辺に自己修復ロジックを再導入する余地を残してある
 
 ### M5Stack Basic（マスター）側のサンプルコード
 
@@ -232,7 +242,8 @@ Notify callback for characteristic ... of data length N
 - I2Cスレーブアドレス: `#define I2C_SLAVE_ADDR 0x08` で変更可
 - I2Cピン: Xiao nRF52840の既定Wireピン（D4=SDA, D5=SCL）を使用。変更する場合は `Wire.begin()` の前に `Wire.setPins(sda, scl)` を呼び出す
 - フレームサイズ: `#define I2C_FRAME_SIZE 32` で変更可（データ本体は `I2C_FRAME_SIZE - 2` バイトまで、末尾1byteはコマンドエコー用）
-- コマンド: `CMD_ENGINE_TEMP` / `CMD_PRI_PRE` / `CMD_SEC_PRE` / `CMD_FUEL_PRE` を定義済み。さらに他のデータを中継する場合は新しいコマンド定数とフレーム/ハンドリング（および必要ならタグ文字列）を追加。応答フレームの選択ロジックは `frameForCommand()`（`receiveEvent` から呼ばれる）に実装されている点に注意
+- コマンド: `CMD_ENGINE_TEMP` / `CMD_PRI_PRE` / `CMD_SEC_PRE` / `CMD_FUEL_PRE` を定義済み。さらに他のデータを中継する場合は新しいコマンド定数とフレーム/ハンドリング（および必要ならタグ文字列）を追加  
+  応答フレームの選択ロジックは `frameForCommand()`（`receiveEvent` から呼ばれる）に実装されている点に注意
 - LED ピン: `LED_RED` / `#define BLUE_LED_PIN LED_BLUE`（オンボードLEDの赤・青。実機がactive-lowだったため独自定義した `LED_ON` / `LED_OFF` マクロで極性を吸収しているため、点灯/消灯の記述に極性を意識する必要はない）
 - UUID: `SERVICE_UUID`（共通）/ `HEATER_CHARACTERISTIC_UUID` / `HEATER_NOTIFY_CHARACTERISTIC_UUID` / `AUTOAIR_CHARACTERISTIC_UUID` / `AUTOAIR_NOTIFY_CHARACTERISTIC_UUID` で差し替え可能
 - デバイス名フィルタ: `HEATER_DEVICE_NAME` / `AUTOAIR_DEVICE_NAME`（接続先の判別に使用、Service UUID が共通のため必須）
