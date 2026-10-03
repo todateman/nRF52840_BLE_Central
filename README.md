@@ -15,7 +15,7 @@ M5Stack シリーズ（ESP32）では Wi-Fi と BLE を同時利用できない�
 - オンボードLED(赤/青)で接続状態を表示（いずれか未接続=赤、Heater・AutoAirAdjust両方接続完了=青の排他点灯。詳細は後述）
 - I2C スレーブ化（アドレス 0x08、コマンドで要求データの種類を指定して応答。標準 `Wire` ライブラリの `onReceive`/`onRequest` を使用、詳細は後述）
 - PlatformIO プロジェクト構成（複数 env 拡張可能）
-- BLE/I2C/LED更新ともにコールバック駆動（`loop()` は何も行わない）
+- BLE/I2C/LED更新ともにコールバック駆動。`loop()` はコールバックだけでは回復できない状態（古いデータの残留・Notify途絶・接続試行の停滞・スキャナー停止）の監視と復旧のみを行う（詳細は後述「データ鮮度と再接続の監視」）
 
 ## ハードウェア要件
 
@@ -73,10 +73,26 @@ Service UUID は両ペリフェラルで共通のため、接続先の判別は 
 4. Notify 受信（`notifyCallback`）:
    - 改行までのデータを先頭タグ（`PRI:` / `SEC:` / `FUEL:` / タグなし）で判別し、対応する I2C 送信用フレーム（`priPreFrame` / `secPreFrame` / `fuelPreFrame` / `engineTempFrame`）に格納・保持し、M5Stack Basic からの要求を待機
    - Heater / AutoAirAdjust それぞれ専用の受信バッファを保持するため、2台からの Notify が混ざることはない
-5. 未接続のペリフェラルが残っている限り、スキャンを継続する（`Bluefruit.Scanner` がコールバック駆動でスキャンを管理するため、`loop()` 側でのポーリングは不要）
+   - フレームごとに最終更新時刻を記録する（古いデータの破棄に使用）。フレームの書き換えは `taskENTER_CRITICAL()` で保護し、I2C 割り込み（`receiveEvent`）が書き換え途中のフレームを読まないようにしている
+5. 未接続のペリフェラルが残っている限り、スキャンを継続する（`connectCallback` / `disconnectCallback` の最後でスキャンを再開し、`loop()` の `ensureScanning()` でも止まっていないかを確認する）
 6. 切断イベント発生時（`disconnectCallback`）:
-   - 切断されたペリフェラルのみ状態をリセットし、`Bluefruit.Scanner.restartOnDisconnect(true)` により自動的に再スキャン・再接続を試みる（もう一方の接続は維持される）
+   - 切断されたペリフェラルのみ状態をリセットし、そのペリフェラルのデータ用フレームも空にする（Heater なら `engineTempFrame`、AutoAirAdjust なら PRI/SEC/FUEL の3つ）。切断後も最後の値を返し続けないようにするため
+   - `ensureScanning()` でスキャンを再開し、再接続を試みる（もう一方の接続は維持される）。  
+     **`Bluefruit.Scanner.restartOnDisconnect(true)` だけでは不十分**: Bluefruit はすべての Central 接続が切れたときにしかスキャンを自動再開しない（`BLEScanner.cpp` の `0 == Bluefruit.Central.connected()` 判定）。そのため AutoAirAdjust 接続中に Heater だけが切断されるとスキャンが止まったままになり、Heater は再接続されなかった。さらに切断後もフレームが残っていたため、マスター側では温度が古い値のまま記録され続けていた（2026-10 に LOG0645 で発覚した不具合）
    - 接続状態表示LEDを更新（後述）
+
+### データ鮮度と再接続の監視（`loop()`）
+
+`loop()` は 100ms（`WATCHDOG_INTERVAL_MS`）ごとに次の監視を行う。
+
+| 監視項目 | しきい値 | 処理 |
+| ---- | ---- | ---- |
+| 古いデータ | `FRAME_STALE_MS` = 3000ms | 更新が止まったフレームを空（長さ0）にする。マスター側は長さ0を無効値として扱い、2秒後に `0.0` へリセットするため、古い値が記録され続けない |
+| Notify 途絶 | `NOTIFY_SILENCE_MS` = 5000ms | 接続は維持されているのにメッセージが届かない場合（送信側のセンサー異常・タスク停止・購読外れ等）、`Bluefruit.disconnect()` で切断し、再接続させる |
+| 接続試行の停滞 | `CONNECT_TIMEOUT_MS` = 10000ms | `STATE_DO_CONNECT` のまま接続が成立しない場合、`sd_ble_gap_connect_cancel()` で打ち切ってスキャンに戻る。`Scanner.start(0)`（タイムアウトなし）のパラメータで接続するため、相手が消えると接続試行が終わらず、スキャナーも止まったままになるため |
+| スキャナー停止 | — | 未接続のペリフェラルが残っているのにスキャナーが止まっていれば再開する（`ensureScanning()`） |
+
+あわせて `scanCallback` では `Bluefruit.Central.connect()` の戻り値を確認し、接続要求自体が失敗した場合（コールバックが来ない）は状態を `STATE_IDLE` に戻してスキャンを続ける。
 
 ### 接続状態表示LED
 
@@ -124,8 +140,8 @@ AutoAirAdjust 側の BLE 送信機能は [feature/BLE ブランチ, commit 5b8b8
   - `[0]`: データ長 (0〜30)
   - `[1..30]`: データ本体（余りはゼロ埋め）
   - `[31]`: 直前にマスターが書き込んだコマンドのエコーバック（マスター側でコマンドと応答のズレを検知するための仕組み）
-  - BLE Notify 未受信時（起動直後など）は全ゼロを返す
-- 動作: マスターがコマンドを書き込んだ後 `Wire.requestFrom()` で読み出すと、直近に BLE で受信した最新データを返す（新しい Notify を受信するまで同じ値を返し続ける）
+  - BLE Notify 未受信時（起動直後など）、切断時、最終更新から `FRAME_STALE_MS`（3秒）以上経過した場合は、長さ0（データ部全ゼロ）を返す
+- 動作: マスターがコマンドを書き込んだ後 `Wire.requestFrom()` で読み出すと、直近に BLE で受信した最新データを返す（新しい Notify を受信するまで同じ値を返すが、`FRAME_STALE_MS` を超えると長さ0になる）
 
 ### スレーブ側の実装メモ（nRF52840 での I2C スレーブ実装）
 
@@ -235,6 +251,17 @@ Connected to server (ChibiT-AutoAirAdjust)
 Notify callback for characteristic ... of data length N
 ```
 
+監視処理（`loop()`）が働いた場合は、次のようなログが出る。
+
+```text
+onDisconnect (M5Din Furoshiki Heater), reason = 0x08
+Restarting scanner
+I2C frame cleared (stale): ENGINE_TEMP
+[M5Din Furoshiki Heater] No notify for 5000 ms, disconnecting
+[M5Din Furoshiki Heater] Connect timeout, canceled
+connect() failed (M5Din Furoshiki Heater)
+```
+
 `[LED] ...` 行は `updateConnectionLed()` が接続/切断イベントのたびに出力する診断ログで、各ペリフェラルの状態（`STATE_IDLE=0` / `STATE_DO_CONNECT=1` / `STATE_CONNECTED=3`）と、その結果として点灯させたLEDの色を確認できる。
 
 ## カスタマイズポイント
@@ -247,7 +274,8 @@ Notify callback for characteristic ... of data length N
 - LED ピン: `LED_RED` / `#define BLUE_LED_PIN LED_BLUE`（オンボードLEDの赤・青。実機がactive-lowだったため独自定義した `LED_ON` / `LED_OFF` マクロで極性を吸収しているため、点灯/消灯の記述に極性を意識する必要はない）
 - UUID: `SERVICE_UUID`（共通）/ `HEATER_CHARACTERISTIC_UUID` / `HEATER_NOTIFY_CHARACTERISTIC_UUID` / `AUTOAIR_CHARACTERISTIC_UUID` / `AUTOAIR_NOTIFY_CHARACTERISTIC_UUID` で差し替え可能
 - デバイス名フィルタ: `HEATER_DEVICE_NAME` / `AUTOAIR_DEVICE_NAME`（接続先の判別に使用、Service UUID が共通のため必須）
-- 再接続ポリシー: 切断されたペリフェラルのみ `resetPeripheral()` で状態をリセットし、`Bluefruit.Scanner.restartOnDisconnect(true)` により自動的に再接続を試みる（もう一方の接続には影響しない）
+- 再接続ポリシー: 切断されたペリフェラルのみ `resetPeripheral()` で状態とデータ用フレームをリセットし、`ensureScanning()` でスキャンを再開して再接続を試みる（もう一方の接続には影響しない）
+- 監視しきい値: `FRAME_STALE_MS` / `NOTIFY_SILENCE_MS` / `CONNECT_TIMEOUT_MS` / `WATCHDOG_INTERVAL_MS`（送信側の Notify 周期より十分長くすること。Heater は1秒周期）
 
 ## 今後の改善案
 
@@ -255,11 +283,9 @@ Notify callback for characteristic ... of data length N
 - アクティブスキャンによる消費電力増への対応（必要ならスキャン間隔/ウィンドウの調整）
 - 3台目以降のペリフェラル追加が必要になった場合の汎用化（現状は Heater/AutoAirAdjust の2台固定の意図的な設計）
 - 再接続の待機/バックオフ（現状は見つかり次第即座に再接続を試みるのみ）
-- Notify データのタイムアウト検知（一定時間 Notify が来ない場合に「値が古い」ことを判別する仕組み）
 - Write キャラクタリスティック活用 (将来の制御コマンド)
 - データ検証 (CRC / バージョン / シーケンス番号)
 - 状態遷移図とエラーハンドリング整備
-- BLE接続タイムアウト（`BLE_GAP_EVT_TIMEOUT`）の未処理: 接続試行が応答なくタイムアウトした場合、`connectCallback`/`disconnectCallback` いずれも呼ばれず該当ペリフェラルが `STATE_DO_CONNECT` のまま復帰できなくなる可能性があり、ハンドリングの追加を検討
 - I2Cスレーブ簡素化（ESP-IDFネイティブAPI依存の撤去、標準Wireへの回帰）が実機でも安定して動作するかの長時間検証、および BLE central 処理（スキャン/接続）との競合有無の確認
 
 ## ライセンス
@@ -267,7 +293,9 @@ Notify callback for characteristic ... of data length N
 本ソフトウェアは MIT License です。`LICENSE` を参照してください。
 
 ---
-ドキュメント最終更新: 2026-08-09 (M5NanoC6 (ESP32-C6) から Seeed Xiao nRF52840 へ移植。I2Cスレーブを ESP-IDF ネイティブドライバから標準 `Wire` ライブラリへ、BLE Central を arduino-esp32 の `BLEDevice` から `Bluefruit52Lib` へ全面書き換え。
+ドキュメント最終更新: 2026-10-03 (エンジン温度が古い値のまま記録され続ける不具合を修正。Heater だけ切断されるとスキャンが再開されなかった問題と、切断後も古いフレームを返し続けていた問題に対処し、`loop()` にデータ鮮度・Notify途絶・接続試行停滞の監視を追加)
+
+2026-08-09 (M5NanoC6 (ESP32-C6) から Seeed Xiao nRF52840 へ移植。I2Cスレーブを ESP-IDF ネイティブドライバから標準 `Wire` ライブラリへ、BLE Central を arduino-esp32 の `BLEDevice` から `Bluefruit52Lib` へ全面書き換え。
 
 その後の実機デバッグで判明した3件の接続不良の原因を修正: (1) `Scanner.filterUuid()` がアドバタイズ名を含むScan Responseパケットを誤って破棄していた、(2) 接続後の `getPeerName()` によるピア名再判別がATT MTU既定値(23byte)で20byte以上の名前を切り詰めて誤判定していた、(3) 対向機側がPRI/SEC/FUELを1回のnotifyにまとめて送信しATT MTU超過分が切り捨てられていた(`Chibi-T_Furoshiki_AutoAirAdjust`側で個別notifyに分割して解消)。
 

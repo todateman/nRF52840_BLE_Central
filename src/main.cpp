@@ -56,11 +56,23 @@
 
 static const size_t RX_BUFFER_MAX = 256;  // Notify受信バッファの最大サイズ
 
+// 古いデータを返し続けないための監視しきい値(loop()で判定)
+#define FRAME_STALE_MS 3000       // この時間更新されないフレームは空にする(マスター側で無効値扱いになる)
+#define NOTIFY_SILENCE_MS 5000    // 接続中にこの時間Notifyが来なければ切断して再接続させる
+#define CONNECT_TIMEOUT_MS 10000  // 接続試行(STATE_DO_CONNECT)がこの時間解決しなければ打ち切る
+#define WATCHDOG_INTERVAL_MS 100  // loop()での監視周期
+
 // 各データのI2C送信用フレーム（先頭1byteが長さ、以降が実データ）。M5Stack Basicからの要求時に最新値を返す
 static uint8_t engineTempFrame[I2C_FRAME_SIZE] = {0};
 static uint8_t priPreFrame[I2C_FRAME_SIZE] = {0};
 static uint8_t secPreFrame[I2C_FRAME_SIZE] = {0};
 static uint8_t fuelPreFrame[I2C_FRAME_SIZE] = {0};
+
+// 各フレームの最終更新時刻(millis)。FRAME_STALE_MSを超えたフレームはloop()で空にする
+static uint32_t engineTempUpdatedAt = 0;
+static uint32_t priPreUpdatedAt = 0;
+static uint32_t secPreUpdatedAt = 0;
+static uint32_t fuelPreUpdatedAt = 0;
 
 #define STATE_IDLE 0
 #define STATE_DO_CONNECT 1
@@ -81,6 +93,8 @@ struct PeripheralContext
   uint16_t connHandle;                     // 接続確立後のコネクションハンドル
   int8_t state;                            // STATE_IDLE / STATE_DO_CONNECT / STATE_CONNECTED
   String rxBuffer;                         // このペリフェラル専用のNotify受信バッファ
+  uint32_t connectStartedAt;               // STATE_DO_CONNECTにした時刻(接続試行タイムアウト判定用)
+  uint32_t lastNotifyAt;                   // 最後にメッセージを受信した時刻(Notify途絶判定用)
 };
 
 // Service UUIDはHeater/AutoAirAdjustで共通のため1つを使い回す(Scannerのフィルタにも使用)
@@ -91,15 +105,27 @@ static PeripheralContext peripherals[PERIPH_COUNT] = {
     {HEATER_DEVICE_NAME, BLEClientService(serviceUuid),
      BLEClientCharacteristic(HEATER_CHARACTERISTIC_UUID),
      BLEClientCharacteristic(HEATER_NOTIFY_CHARACTERISTIC_UUID),
-     BLE_CONN_HANDLE_INVALID, STATE_IDLE, ""},
+     BLE_CONN_HANDLE_INVALID, STATE_IDLE, "", 0, 0},
     // AutoAirAdjust: 1次/2次側空気圧・燃圧(PRI:/SEC:/FUEL:タグ付き)を送信
     {AUTOAIR_DEVICE_NAME, BLEClientService(serviceUuid),
      BLEClientCharacteristic(AUTOAIR_CHARACTERISTIC_UUID),
      BLEClientCharacteristic(AUTOAIR_NOTIFY_CHARACTERISTIC_UUID),
-     BLE_CONN_HANDLE_INVALID, STATE_IDLE, ""},
+     BLE_CONN_HANDLE_INVALID, STATE_IDLE, "", 0, 0},
 };
 
-// 指定ペリフェラルの状態を初期化し、次のscanCallback()で再発見できるようにする
+// フレームを長さ0(データなし)にする。マスター側は長さ0を無効値として扱い、
+// 一定時間後にタイムアウト処理(0表示)へ移行するため、古い値を返し続けずに済む。
+// receiveEvent(ISR)との競合を避けるためクリティカルセクションで書き換える
+// (taskENTER_CRITICALはSoftDeviceの割り込みを止めずに、優先度3のTWIS割り込みはマスクできる)
+static void clearFrame(uint8_t *frame)
+{
+  taskENTER_CRITICAL();
+  memset(frame, 0, I2C_FRAME_SIZE - 1);  // 末尾1byteはコマンドエコー用に予約
+  taskEXIT_CRITICAL();
+}
+
+// 指定ペリフェラルの状態を初期化し、次のscanCallback()で再発見できるようにする。
+// 切断後も最後の値を返し続けないよう、そのペリフェラルが送ってくるデータのフレームも空にする
 static void resetPeripheral(int idx)
 {
   PeripheralContext &p = peripherals[idx];
@@ -108,6 +134,17 @@ static void resetPeripheral(int idx)
   p.state = STATE_IDLE;
   // service/characteristicの探索状態はBluefruitが切断イベントで内部的にリセットするため、
   // ESP32-C6版のようなヒープ管理(delete)は不要
+
+  if (idx == PERIPH_HEATER)
+  {
+    clearFrame(engineTempFrame);
+  }
+  else
+  {
+    clearFrame(priPreFrame);
+    clearFrame(secPreFrame);
+    clearFrame(fuelPreFrame);
+  }
 }
 
 // 未接続(STATE_CONNECTED以外)のペリフェラルが1台でも残っていればスキャンが必要
@@ -121,6 +158,27 @@ static bool needsScan()
     }
   }
   return false;
+}
+
+// 未接続のペリフェラルが残っているのにスキャナーが止まっていれば再開する。
+// Bluefruit.Scanner.restartOnDisconnect(true)は「Central接続が1台も無くなった時」にしか
+// 自動再開しないため、AutoAirAdjust接続中にHeaterだけ切断された場合などはここで再開しないと
+// 二度と再接続されない(温度だけが更新されなくなる不具合の原因だった)
+static void ensureScanning()
+{
+  if (!needsScan() || Bluefruit.Scanner.isRunning())
+  {
+    return;
+  }
+  for (int i = 0; i < PERIPH_COUNT; i++)
+  {
+    if (peripherals[i].state == STATE_DO_CONNECT)
+    {
+      return;  // 接続試行中はスキャナーが一時停止しているのが正常なので触らない
+    }
+  }
+  Serial.println("Restarting scanner");
+  Bluefruit.Scanner.start(0);
 }
 
 // 接続状態表示LEDを更新する。Heater/AutoAirAdjustの両方が接続完了していれば
@@ -156,15 +214,20 @@ static int findPeripheralByName(const char *name)
 // 末尾1byte(frame[I2C_FRAME_SIZE-1])はコマンドエコー用に予約し、ここでは触れない
 // (実際の値はreceiveEventが書き込み直前に設定する。マスター側でコマンドと応答のズレを
 //  検知できるようにするための仕組み)
-static void updateFrame(uint8_t *frame, const String &value)
+// receiveEvent(ISR)が書き換え途中のフレームを読まないよう、clearFrame()と同じく
+// クリティカルセクションで書き換え、更新時刻(updatedAt)も記録する
+static void updateFrame(uint8_t *frame, uint32_t &updatedAt, const String &value)
 {
   size_t dataLen = min(value.length(), (size_t)(I2C_FRAME_SIZE - 2));
+  taskENTER_CRITICAL();
   frame[0] = (uint8_t)dataLen;
   memcpy(&frame[1], value.c_str(), dataLen);
   if (dataLen < I2C_FRAME_SIZE - 2)
   {
     memset(&frame[1 + dataLen], 0, I2C_FRAME_SIZE - 2 - dataLen);
   }
+  taskEXIT_CRITICAL();
+  updatedAt = millis();
 }
 
 static void notifyCallback(BLEClientCharacteristic *chr, uint8_t *data, uint16_t length)
@@ -200,27 +263,28 @@ static void notifyCallback(BLEClientCharacteristic *chr, uint8_t *data, uint16_t
       // 改行を受信 → メッセージ完成
       Serial.print("Complete message: ");
       Serial.println(rxBuffer.c_str());
+      peripherals[idx].lastNotifyAt = millis();  // Notify途絶判定用
 
       // 先頭のタグでデータ種別を判別し、対応するフレームを更新する
       // （タグが無い場合は従来どおりCMD_ENGINE_TEMP用として扱う）
       if (rxBuffer.startsWith(TAG_PRI_PRE))
       {
-        updateFrame(priPreFrame, rxBuffer.substring(strlen(TAG_PRI_PRE)));
+        updateFrame(priPreFrame, priPreUpdatedAt, rxBuffer.substring(strlen(TAG_PRI_PRE)));
         Serial.println("I2C frame updated: PRI_PRE");
       }
       else if (rxBuffer.startsWith(TAG_SEC_PRE))
       {
-        updateFrame(secPreFrame, rxBuffer.substring(strlen(TAG_SEC_PRE)));
+        updateFrame(secPreFrame, secPreUpdatedAt, rxBuffer.substring(strlen(TAG_SEC_PRE)));
         Serial.println("I2C frame updated: SEC_PRE");
       }
       else if (rxBuffer.startsWith(TAG_FUEL_PRE))
       {
-        updateFrame(fuelPreFrame, rxBuffer.substring(strlen(TAG_FUEL_PRE)));
+        updateFrame(fuelPreFrame, fuelPreUpdatedAt, rxBuffer.substring(strlen(TAG_FUEL_PRE)));
         Serial.println("I2C frame updated: FUEL_PRE");
       }
       else
       {
-        updateFrame(engineTempFrame, rxBuffer);
+        updateFrame(engineTempFrame, engineTempUpdatedAt, rxBuffer);
         Serial.println("I2C frame updated: ENGINE_TEMP");
       }
 
@@ -316,6 +380,7 @@ static void connectCallback(uint16_t conn_handle)
 
   if (discoverAndSubscribe(p, conn_handle))
   {
+    p.lastNotifyAt = millis();  // Notify途絶判定は接続完了時点から計測する
     p.state = STATE_CONNECTED;
     Serial.printf("Connected to server (%s)\n", p.name);
   }
@@ -336,8 +401,9 @@ static void connectCallback(uint16_t conn_handle)
   }
 }
 
-// 切断時に呼ばれる。切断されたペリフェラルのみ状態をリセットする
-// (Bluefruit.Scanner.restartOnDisconnect(true)によりスキャンは自動的に再開される)
+// 切断時に呼ばれる。切断されたペリフェラルのみ状態をリセットし、スキャンを再開する
+// (Bluefruit.Scanner.restartOnDisconnect(true)は全Central接続が切れた時しか自動再開しないため、
+//  もう一方が接続中のままでも再接続できるよう、ensureScanning()で明示的に再開する)
 static void disconnectCallback(uint16_t conn_handle, uint8_t reason)
 {
   for (int i = 0; i < PERIPH_COUNT; i++)
@@ -351,6 +417,7 @@ static void disconnectCallback(uint16_t conn_handle, uint8_t reason)
   }
 
   updateConnectionLed();  // 未接続に戻ったので接続状態表示LEDを更新（黄色に戻す）
+  ensureScanning();
 }
 
 // スキャン結果を受信するたびに呼ばれる。SoftDevice仕様上、レポート受信のたびに
@@ -370,8 +437,16 @@ static void scanCallback(ble_gap_evt_adv_report_t *report)
     {
       Serial.printf("Device found! (%s)\n", peripherals[idx].name);
       peripherals[idx].state = STATE_DO_CONNECT;
-      Bluefruit.Central.connect(report);  // 結果はconnectCallback/disconnectCallbackへ通知される
-      return;  // connect()呼び出し後はスキャナーが一時停止するのでresume()は不要
+      peripherals[idx].connectStartedAt = millis();
+      // 結果はconnectCallback/disconnectCallbackへ通知される。接続が成立しないまま
+      // 終わらない場合はloop()がCONNECT_TIMEOUT_MSで打ち切る
+      if (Bluefruit.Central.connect(report))
+      {
+        return;  // connect()呼び出し後はスキャナーが一時停止するのでresume()は不要
+      }
+      // 接続要求自体が失敗した場合はコールバックが来ないため、ここで元に戻してスキャンを続ける
+      Serial.printf("connect() failed (%s)\n", peripherals[idx].name);
+      peripherals[idx].state = STATE_IDLE;
     }
   }
 
@@ -536,9 +611,60 @@ void setup()
   Serial.println("Scanning...");
 }
 
+// 一定時間更新されていないフレームを空にする
+static void clearFrameIfStale(uint8_t *frame, uint32_t updatedAt, const char *label)
+{
+  if (frame[0] != 0 && (millis() - updatedAt) > FRAME_STALE_MS)
+  {
+    clearFrame(frame);
+    Serial.printf("I2C frame cleared (stale): %s\n", label);
+  }
+}
+
 void loop()
 {
-  // BLE(スキャン/接続/Notify)・I2Cスレーブ応答・接続状態表示LEDの更新は全て
-  // コールバック駆動(connectCallback/disconnectCallback/notifyCallback/receiveEvent/
-  // requestEvent)のため、loop()側で行う処理は無い
+  // BLE(スキャン/接続/Notify)・I2Cスレーブ応答・接続状態表示LEDの更新はコールバック駆動
+  // (connectCallback/disconnectCallback/notifyCallback/receiveEvent/requestEvent)。
+  // loop()では、コールバックだけでは回復できない状態(古いデータの残留・Notify途絶・
+  // 接続試行の停滞・スキャナー停止)を監視して復旧させる
+  uint32_t now = millis();
+
+  // 古いデータの破棄: マスターが古い値を有効値として記録し続けないようにする
+  clearFrameIfStale(engineTempFrame, engineTempUpdatedAt, "ENGINE_TEMP");
+  clearFrameIfStale(priPreFrame, priPreUpdatedAt, "PRI_PRE");
+  clearFrameIfStale(secPreFrame, secPreUpdatedAt, "SEC_PRE");
+  clearFrameIfStale(fuelPreFrame, fuelPreUpdatedAt, "FUEL_PRE");
+
+  for (int i = 0; i < PERIPH_COUNT; i++)
+  {
+    PeripheralContext &p = peripherals[i];
+
+    // Notify途絶: 接続は維持されているのにデータが来ない(送信側の停止・購読外れ等)場合は
+    // 切断して再接続させる(以降はdisconnectCallback→再スキャンで復旧する)
+    if (p.state == STATE_CONNECTED && (now - p.lastNotifyAt) > NOTIFY_SILENCE_MS)
+    {
+      Serial.printf("[%s] No notify for %d ms, disconnecting\n", p.name, NOTIFY_SILENCE_MS);
+      p.lastNotifyAt = now;  // 切断完了までの間に繰り返し要求しないようにする
+      Bluefruit.disconnect(p.connHandle);
+    }
+
+    // 接続試行の停滞: Scanner.start(0)のパラメータ(タイムアウト無し)で接続しているため、
+    // 相手が消えると接続試行が終わらずスキャナーも止まったままになる。打ち切ってスキャンに戻す
+    if (p.state == STATE_DO_CONNECT && (now - p.connectStartedAt) > CONNECT_TIMEOUT_MS)
+    {
+      // 失敗(NRF_ERROR_INVALID_STATE)は接続が既に成立しconnectCallbackが処理待ちであることを
+      // 意味するため、その場合は何もしない
+      if (sd_ble_gap_connect_cancel() == NRF_SUCCESS)
+      {
+        Serial.printf("[%s] Connect timeout, canceled\n", p.name);
+        resetPeripheral(i);
+        Bluefruit.Scanner.start(0);
+      }
+    }
+  }
+
+  // 安全策: 未接続のペリフェラルが残っているのにスキャナーが止まっていれば再開する
+  ensureScanning();
+
+  delay(WATCHDOG_INTERVAL_MS);
 }
